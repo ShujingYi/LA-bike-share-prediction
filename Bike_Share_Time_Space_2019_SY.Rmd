@@ -1,0 +1,856 @@
+---
+title: "Space-Time Prediction of LA Metro Bike Share Demand "
+author: "Shujing Yi"
+date: "2022-11-17"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: "hide"
+    code_download: true
+---
+
+# 1 Introduction
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+A bike share program makes bicycles available to a city's inhabitants so they can rent a bike for daily activities. A bike share program provides great convenience to people biking to work, gyms, schools, etc.,  without the trouble of keeping and maintaining their own bikes. However, one of urban bike share systems' most challenging operational problems is the need to re-balance bicycles across the network. Bike share is useless if a dock has no bikes to pick up or open docking spaces to deposit a bike. Re-balancing is to predict bike share demand for all docks at all times and redistribute bikes to ensure a bike or a docking place is available when needed.
+
+There are many different ways to re-balancing the bikes. Since many people use bike share only for fast and convenience, incentives for riders to move bikes from place to place probably won't work well, especially during peak hours and bad weather. Instead, managing a small fleet of trucks to move bikes from here to there hourly could be a stable and very efficient method. 
+
+We will use the data from LA Metro Bike Share in this project. We will predict only the demand, ignoring the supply of bikes, network routing of re-balancing trucks, etc. Still, modeling and validation with accounting for weather and time effects and experimenting with some amenity features will give us a window into how we can use time-space predictive modeling to address an operations issue. If we knew the bike station capacities, we could see when demand for bikes might drive stations to run out of bikes and then move excess bikes from elsewhere. A program manager for a bike-share system could reasonably anticipate demand and allocate bikes ahead of time.
+
+
+
+# 2 Data Wrangling
+
+## 2.1 Setup
+
+Let's load relevant libraries and some graphic themes. 
+
+```{r setup_13, cache=TRUE, message=FALSE}
+library(tidyverse)
+library(sf)
+library(sp)
+library(lubridate)
+library(tigris)
+library(tidycensus)
+library(RSocrata)
+library(viridis)
+library(riem)
+library(FNN)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(RSocrata)
+library(stargazer)
+library(sf)
+library(spdep)
+library(caret)
+library(ckanr)
+
+
+
+
+
+plotTheme <- theme(
+  plot.title =element_text(size=12),
+  plot.subtitle = element_text(size=8),
+  plot.caption = element_text(size = 6),
+  axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+  axis.text.y = element_text(size = 10),
+  axis.title.y = element_text(size = 10),
+  # Set the entire chart region to blank
+  panel.background=element_blank(),
+  plot.background=element_blank(),
+  #panel.border=element_rect(colour="#F0F0F0"),
+  # Format the grid
+  panel.grid.major=element_line(colour="#D0D0D0",size=.2),
+  axis.ticks=element_blank())
+
+mapTheme <- theme(plot.title =element_text(size=12),
+                  plot.subtitle = element_text(size=8),
+                  plot.caption = element_text(size = 6),
+                  axis.line=element_blank(),
+                  axis.text.x=element_blank(),
+                  axis.text.y=element_blank(),
+                  axis.ticks=element_blank(),
+                  axis.title.x=element_blank(),
+                  axis.title.y=element_blank(),
+                  panel.background=element_blank(),
+                  panel.border=element_blank(),
+                  panel.grid.major=element_line(colour = 'transparent'),
+                  panel.grid.minor=element_blank(),
+                  legend.direction = "vertical", 
+                  legend.position = "right",
+                  plot.margin = margin(1, 1, 1, 1, 'cm'),
+                  legend.key.height = unit(1, "cm"), legend.key.width = unit(0.2, "cm"))
+
+palette5 <- c("#eff3ff","#bdd7e7","#6baed6","#3182bd","#08519c")
+palette4 <- c("#D2FBD4","#92BCAB","#527D82","#123F5A")
+palette3 <- c("#6baed6","#3182bd","#08519c")
+palette2 <- c("#6baed6","#08519c")
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+
+
+```{r install_census_API_key, warning = FALSE, include=FALSE, eval = TRUE}
+# Install Census API Key
+tidycensus::census_api_key("e79f3706b6d61249968c6ce88794f6f556e5bf3d", overwrite = TRUE)
+```
+
+
+## 2.2 Import Bike Share Data
+
+We got the 2019 Q3 bike share data from LA Metro Bike Share website and then bin the data in 15 and 60-minute intervals by rounding.
+Data source: https://bikeshare.metro.net/about/data/
+
+```{r read_dat }
+dat <- read.csv("Data/metro-bike-share-trips-2019-q3.csv")
+```
+
+
+```{r , warning=FALSE}
+dat2 <- 
+  dat%>%
+  mutate(interval60 = floor_date(mdy_hm(start_time), unit = "hour"),
+         interval15 = floor_date(mdy_hm(start_time), unit = "15 mins"),
+         week = week(interval60),
+         dotw = wday(interval60, label=TRUE))
+
+```
+
+
+## 2.3 Import Census Info
+
+Using the `tidycensus` package, we can download census geography and variables for Los Angeles in 2019. These are used to test generalizeability later, but we don't use them as independent variables because they end up being perfectly colinear with the stations fixed effects. 
+
+We add the spatial information to our bike share data as origin and destination data, first joining the origin station, then the destination station to our census data. 
+
+```{r get_census, message=FALSE, warning=FALSE, cache=TRUE, results = 'hide'}
+LACensus <- 
+  get_acs(geography = "tract", 
+          variables = c("B01003_001", "B19013_001", 
+                        "B02001_002", "B08013_001",
+                        "B08012_001", "B08301_001", 
+                        "B08301_010", "B01002_001"), 
+          year = 2019, 
+          state = "CA", 
+          geometry = TRUE, 
+          county=c("Los Angeles"),
+          output = "wide") %>%
+  rename(Total_Pop =  B01003_001E,
+         Med_Inc = B19013_001E,
+         Med_Age = B01002_001E,
+         White_Pop = B02001_002E,
+         Travel_Time = B08013_001E,
+         Num_Commuters = B08012_001E,
+         Means_of_Transport = B08301_001E,
+         Total_Public_Trans = B08301_010E) %>%
+  select(Total_Pop, Med_Inc, White_Pop, Travel_Time,
+         Means_of_Transport, Total_Public_Trans,
+         Med_Age,
+         GEOID, geometry) %>%
+  mutate(Percent_White = White_Pop / Total_Pop,
+         Mean_Commute_Time = Travel_Time / Total_Public_Trans,
+         Percent_Taking_Public_Trans = Total_Public_Trans / Means_of_Transport)
+```
+
+```{r extract_geometries }
+LATracts <- 
+  LACensus %>%
+  as.data.frame() %>%
+  distinct(GEOID, .keep_all = TRUE) %>%
+  select(GEOID, geometry) %>% 
+  st_sf
+
+```
+
+```{r , message = FALSE, warning = FALSE}
+dat_census <- st_join(dat2 %>% 
+          filter(is.na(start_lon) == FALSE &
+                   is.na(start_lat) == FALSE &
+                   is.na(end_lat) == FALSE &
+                   is.na(end_lon) == FALSE) %>%
+          st_as_sf(., coords = c("start_lon", "start_lat"), crs = 4326),
+        LATracts %>%
+          st_transform(crs=4326),
+        join=st_intersects,
+              left = TRUE) %>%
+  rename(Origin.Tract = GEOID) %>%
+  mutate(start_lon = unlist(map(geometry, 1)),
+         start_lat = unlist(map(geometry, 2)))%>%
+  as.data.frame() %>%
+  select(-geometry)%>%
+  st_as_sf(., coords = c("end_lon", "end_lat"), crs = 4326) %>%
+  st_join(., LATracts %>%
+            st_transform(crs=4326),
+          join=st_intersects,
+          left = TRUE) %>%
+  rename(Destination.Tract = GEOID)  %>%
+  mutate(end_lon = unlist(map(geometry, 1)),
+         end_lat = unlist(map(geometry, 2)))%>%
+  as.data.frame() %>%
+  select(-geometry)
+```
+
+Select 5 weeks from the data: week 28-32, which is from July 9, 2019 to August 12, 2019.
+```{r , message = FALSE, warning = FALSE}
+dat_census <-dat_census %>%
+  filter(week >= 28 & week <= 32)
+
+```
+
+## 2.4. Import Weather Data
+
+Import weather data from LOS ANGELES DOWNTOWN/USC (code CQT) using `riem_measures`. We can `mutate` the data to get temperature, wind speed, precipitation on an hourly basis and plot the temperature and precipitation trends over our study period.
+
+
+```{r import_weather, message = FALSE, warning = FALSE }
+weather.Panel <- 
+  riem_measures(station = "CQT", date_start = "2019-07-09", date_end = "2019-08-12") %>%
+  dplyr::select(valid, tmpf, p01i, sknt)%>%
+  replace(is.na(.), 0) %>%
+    mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
+    mutate(week = week(interval60),
+           dotw = wday(interval60, label=TRUE)) %>%
+    group_by(interval60) %>%
+    summarize(Temperature = max(tmpf),
+              Precipitation = sum(p01i),
+              Wind_Speed = max(sknt)) %>%
+    mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+
+
+```
+
+```{r plot_weather, catche = TRUE}
+grid.arrange(
+  ggplot(weather.Panel, aes(interval60,Precipitation)) + geom_line() + 
+  labs(title="Percipitation", x="Hour", y="Perecipitation") + plotTheme(),
+  ggplot(weather.Panel, aes(interval60,Wind_Speed)) + geom_line() + 
+    labs(title="Wind Speed", x="Hour", y="Wind Speed") + plotTheme(),
+  ggplot(weather.Panel, aes(interval60,Temperature)) + geom_line() + 
+    labs(title="Temperature", x="Hour", y="Temperature") + plotTheme(),
+  top="Weather Data - Los Angeles - July & August 2019")
+```
+
+## 2.5 Explore the Data
+
+We begin by examining the time and frequency components of our data.
+
+First, we look at the overall time pattern. The plot indicates daily periodicity and weekend lull periods.  
+
+```{r trip_timeseries }
+ggplot(dat_census %>%
+         group_by(interval60) %>%
+         tally())+
+  geom_line(aes(x = interval60, y = n))+
+  labs(title="Bike share trips per hr. \nLos Angeles, July & August 2019",
+       x="Date", 
+       y="Number of trips")+
+  plotTheme()
+```
+
+Now we examine the distribution of trip volume by the station for different times of the day. The plots below show a few high-volume periods but mostly low volume for all the time of the day. Interestingly, AM rush time has fewer busy stations than other periods. Our data must consist of many low-demand stations/hours and a few high-demand stations/hours. 
+
+
+```{r mean_trips_hist, warning = FALSE, message = FALSE }
+dat_census %>%
+        mutate(time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"))%>%
+         group_by(interval60, start_station, time_of_day) %>%
+         tally()%>%
+  group_by(start_station, time_of_day)%>%
+  summarize(mean_trips = mean(n))%>%
+  ggplot()+
+  geom_histogram(aes(mean_trips), binwidth = 1)+
+  labs(title="Mean Number of Hourly Trips Per Station, \nLos Angeles, July & August 2019",
+       x="Number of trips", 
+       y="Frequency")+
+  facet_wrap(~time_of_day)+
+  plotTheme()
+```
+
+```{r trips_station_dotw }
+ggplot(dat_census %>%
+         group_by(interval60, start_station) %>%
+         tally())+
+  geom_histogram(aes(n), binwidth = 5)+
+  labs(title="Bike share trips per hr by station, \nLos Angeles, July & August 2019",
+       x="Trip Counts", 
+       y="Number of Stations")+
+  plotTheme()
+```
+
+The plot below shows that most bike trips are during the weekday during the PM rush time, morning rush time, and lunch break time. During weekends, most bike trips are from the late morning to evening time. Overall, weekdays are busier than weekends.
+
+```{r trips_hour_dotw }
+ggplot(dat_census %>% mutate(hour = hour(interval15)))+
+     geom_freqpoly(aes(hour, color = dotw), binwidth = 1)+
+  labs(title="Bike share trips in Los Angeles, \nby day of the week,  July & August 2019",
+       x="Hour", 
+       y="Trip Counts")+
+     plotTheme()
+
+
+ggplot(dat_census %>% 
+         mutate(hour = hour(interval15),
+                weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday")))+
+     geom_freqpoly(aes(hour, color = weekend), binwidth = 1)+
+  labs(title="Bike share trips in Los Angeles, \nweekend vs weekday, July & August 2019",
+       x="Hour", 
+       y="Trip Counts")+
+     plotTheme()
+```
+
+The maps below show which location has a higher demand than others with bike share trips per hour by stations on the census tracts. There are four major clusters of stations for bike share. Downtown has high volumes, particularly busy on weekdays.
+
+```{r origin_map}
+ggplot()+
+  geom_sf(data = LATracts, color = "grey80")+
+  geom_point(data = dat_census %>% 
+            mutate(hour = hour(interval15),
+                weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+                time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"))%>%
+              group_by(start_station, start_lat, start_lon, weekend, time_of_day) %>%
+              tally(),
+            aes(x=start_lon, y = start_lat, color = n), 
+            fill = "transparent", alpha = 0.4, size = 1)+
+  scale_colour_viridis(direction = -1,
+  discrete = FALSE, option = "D")+
+  ylim(min(dat_census$start_lat), max(dat_census$start_lat))+
+  xlim(min(dat_census$start_lon), max(dat_census$start_lon))+
+  facet_grid(weekend ~ time_of_day)+
+  labs(title="Bike share trips per hr by station. LA, July & August 2019")+
+  mapTheme()
+```
+
+
+# 3 Create Space-Time Panel
+
+We first create a time-series panel, a unique combination of station id to the hour and day. This is done in order to create a “panel” data set where each time period in the study is represented by a row - whether an observation took place then or not. So if a station didn’t have any trips originating from it at a given hour, we still need a zero in that spot in the panel.
+
+
+
+```{r panel_length_check , message = FALSE, warning = FALSE}
+length(unique(dat_census$interval60)) * length(unique(dat_census$start_station))
+
+
+study.panel <- 
+  expand.grid(interval60=unique(dat_census$interval60), 
+              start_station = unique(dat_census$start_station)) %>%
+  left_join(., dat_census %>%
+              select(start_station, Origin.Tract, start_lon,start_lat )%>%
+              distinct() %>%
+              group_by(start_station) %>%
+              slice(1))
+
+nrow(study.panel)      
+```
+
+
+```{r create_panel , message = FALSE}
+ride.panel <- 
+  dat_census %>%
+  mutate(Trip_Counter = 1) %>%
+  right_join(study.panel) %>% 
+  group_by(interval60, start_station, Origin.Tract, start_lon,start_lat) %>%
+  summarize(Trip_Count = sum(Trip_Counter, na.rm=T)) %>%
+  left_join(weather.Panel) %>%
+  ungroup() %>%
+  filter(is.na(start_station) == FALSE) %>%
+  mutate(week = week(interval60),
+         dotw = wday(interval60, label = TRUE)) %>%
+  filter(is.na(Origin.Tract) == FALSE)
+```
+
+```{r census_and_panel , message = FALSE}
+ride.panel <- 
+  left_join(ride.panel, LACensus %>%
+              as.data.frame() %>%
+              select(-geometry), by = c("Origin.Tract" = "GEOID"))
+```
+
+
+# 4 Feature Engineering
+
+## 4.1 Create time lags
+
+As seen in the data exploration, different period of the day makes a difference in the demand for bikes. So here, we create time lag variables which will give us additional information about the demand during a given period.
+
+We can evaluate the correlations in these lags. As you can see from the table below, there’s a Pearson’s R of 0.82 for the lagHour, which is very strong. The demand right now should be relatively similar to the demand tomorrow at this time and to the demand an hour from now, but twelve hours from now, we likely expect the opposite in terms of demand.
+
+Since the period we choose does not include any significant holidays, we do not need to consider the effects of holidays here.
+
+
+
+```{r time_lags , message = FALSE}
+ride.panel <- 
+  ride.panel %>% 
+  arrange(start_station, interval60) %>% 
+  mutate(lagHour = dplyr::lag(Trip_Count,1),
+         lag2Hours = dplyr::lag(Trip_Count,2),
+         lag3Hours = dplyr::lag(Trip_Count,3),
+         lag4Hours = dplyr::lag(Trip_Count,4),
+         lag12Hours = dplyr::lag(Trip_Count,12),
+         lag1day = dplyr::lag(Trip_Count,24)) %>%
+   mutate(day = yday(interval60)) 
+
+```
+
+```{r evaluate_lags , warning = FALSE, message = FALSE}
+as.data.frame(ride.panel) %>%
+    group_by(interval60) %>% 
+    summarise_at(vars(starts_with("lag"), "Trip_Count"), mean, na.rm = TRUE) %>%
+    gather(Variable, Value, -interval60, -Trip_Count) %>%
+    mutate(Variable = factor(Variable, levels=c("lagHour","lag2Hours","lag3Hours","lag4Hours",
+                                                "lag12Hours","lag1day")))%>%
+    group_by(Variable) %>%  
+    summarize(correlation = round(cor(Value, Trip_Count),2))
+```
+
+## 4.2 Amenity Features
+
+In this section, we look at the nearby amenity factors that might affect stations' bike share demand. Three features are considered - proximity to metro stations, parks, and points of interest on trails. We use the nn_function to calculate the distance of the nearest amenity feature to each station, then we put the results into three categories - close (within 5min walking distance), moderate (5-15min walking distance), and far(more than 15 min walking distance).
+
+```{r}
+ride.panel.sf <-
+  ride.panel %>%
+  mutate(X = start_lon, Y = start_lat )%>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform("EPSG:2229")
+
+```
+
+```{r, message=FALSE, results='hide', warning=FALSE}
+#Metro Station
+Metro_station <- st_read("Data/Metro_Stations/Metro_Stations.shp") %>%
+              st_transform("EPSG:2229")
+ride.panel <-
+  ride.panel %>% 
+    mutate(station_dist  = nn_function(st_coordinates(ride.panel.sf), st_coordinates(Metro_station), 1))
+
+
+ggplot(ride.panel, aes(x=station_dist)) +
+   geom_histogram()+
+  labs(title="Distance to Closest Metro Stop Per Station,\nLos Angeles, July & August 2019",
+       x="Distance to Metro Stops", 
+       y="Frequency")+
+  plotTheme()
+
+
+ride.panel <-
+  ride.panel %>%
+  mutate(Station = case_when(
+    station_dist > 0 & station_dist <= 1320 ~ "1",
+    station_dist > 1320 & station_dist <= 3960 ~ "3",
+    station_dist > 3960 ~ "3"))
+```
+
+
+
+
+
+```{r, message=FALSE, results='hide', warning=FALSE}
+# Park
+parks <-st_read("Data/park/geo_export_4e83d6e2-2ed5-4d44-abd0-a5f1c254e693.shp") %>%
+              st_transform("EPSG:2229") %>%
+              sf::st_make_valid()%>%
+              st_centroid()
+
+ride.panel <-
+  ride.panel %>% 
+    mutate(park_dist  = nn_function(st_coordinates(ride.panel.sf), st_coordinates(st_centroid(parks)), 1))
+
+ggplot(ride.panel, aes(x=park_dist)) +
+   geom_histogram()+
+  labs(title="Distance to Closest Park Per Station,\nLos Angeles, July & August 2019",
+       x="Distance to Park", 
+       y="Frequency")+
+  plotTheme()
+
+ride.panel <-
+  ride.panel %>%
+  mutate(Park = case_when(
+    park_dist > 0 & park_dist <= 1320 ~ "1",
+    park_dist > 1320 & park_dist <= 3960 ~ "2",
+    park_dist > 3960 ~ "3"))
+```
+
+
+```{r, message=FALSE, results='hide', warning=FALSE}
+#Trails points of interest
+POI <- st_read("Data/Countywide_Trails_Points_of_Interest/Countywide_Trails_Points_of_Interest_(Public_-_Hosted).shp") %>%
+              st_transform("EPSG:2229")
+
+ride.panel <-
+  ride.panel %>% 
+    mutate(POI_dist  = nn_function(st_coordinates(ride.panel.sf), st_coordinates(POI), 1))
+
+ggplot(ride.panel, aes(x=POI_dist)) +
+   geom_histogram()+
+  labs(title="Distance to Closest Trails Points of Interest Per Station,\nLos Angeles, July & August 2019",
+       x="Distance to POT", 
+       y="Frequency")+
+  plotTheme()
+
+
+ride.panel <-
+  ride.panel %>%
+  mutate(POI = case_when(
+    POI_dist > 0 & POI_dist <= 1320 ~ "1",
+    POI_dist > 1320 & POI_dist <= 3960 ~ "3",
+    POI_dist > 3960 ~ "3"))
+
+```
+
+
+
+# 5 Linear Regressions
+
+We split our data into a 3-week training and a 2-week test set. Then, we create five linear models using the lm function with our training data ride.Train. The first models include only temporal controls, but the later ones contain all of our lag information and other features modeled in the previous section.
+
+
+
+```{r train_test }
+ride.Train <- filter(ride.panel, week >= 30)
+ride.Test <- filter(ride.panel, week < 30)
+```
+
+
+```{r five_models }
+reg1 <- 
+  lm(Trip_Count ~  hour(interval60) + dotw + Temperature,  data=ride.Train)
+
+reg2 <- 
+  lm(Trip_Count ~  start_station + dotw + Temperature,  data=ride.Train)
+
+reg3 <- 
+  lm(Trip_Count ~  start_station + hour(interval60) + dotw + Temperature + Precipitation, 
+     data=ride.Train)
+
+reg4 <- 
+  lm(Trip_Count ~  start_station +  hour(interval60) + dotw + Temperature + Precipitation +
+                   lagHour + lag2Hours +lag3Hours + lag12Hours + lag1day, 
+     data=ride.Train)
+
+reg5 <- 
+  lm(Trip_Count ~  start_station + hour(interval60) + dotw + Temperature + Precipitation +
+                   lagHour + lag2Hours +lag3Hours +lag12Hours + lag1day +  Station + Park + POI ,  
+     data=ride.Train)
+```
+
+# 6 Predict for test data
+
+We create a function called model_pred which we can then map onto each data frame in our nested structure. As you can see from the table below, the MAE reduces as we add more features and temporal features to the regression. We noticed that distance to amenity features seems like have little influence on the model. 
+
+
+
+```{r nest_data , warning = FALSE, message = FALSE}
+ride.Test.weekNest <- 
+  ride.Test %>%
+  nest(-week) 
+```
+
+
+```{r predict_function }
+model_pred <- function(dat, fit){
+   pred <- predict(fit, newdata = dat)}
+```
+
+
+
+```{r do_predicitons }
+week_predictions <- 
+  ride.Test.weekNest %>% 
+    mutate(ATime_FE = map(.x = data, fit = reg1, .f = model_pred),
+           BSpace_FE = map(.x = data, fit = reg2, .f = model_pred),
+           CTime_Space_FE = map(.x = data, fit = reg3, .f = model_pred),
+           DTime_Space_FE_timeLags = map(.x = data, fit = reg4, .f = model_pred),
+           ETime_Space_FE_timeLags_amenity = map(.x = data, fit = reg5, .f = model_pred)) %>% 
+    gather(Regression, Prediction, -data, -week) %>%
+    mutate(Observed = map(data, pull, Trip_Count),
+           Absolute_Error = map2(Observed, Prediction,  ~ abs(.x - .y)),
+           MAE = map_dbl(Absolute_Error, mean, na.rm = TRUE),
+           sd_AE = map_dbl(Absolute_Error, sd, na.rm = TRUE))
+
+week_predictions
+```
+
+# 7 Cross Validation
+
+Cross-validation is important as it tells us about the generalizability of a model. To check our model's generalizability, we take a sample of the data and run a 100 k-fold validation on it. We can see that the MAE is 0.32 which is quite low. 
+
+
+```{r}
+bikenetsample <- sample_n(ride.panel, 60000)%>%
+  na.omit()
+
+fitControl <- trainControl(method = "cv", 
+                           number = 100,
+                           savePredictions = TRUE)
+
+set.seed(1000)
+# for k-folds CV
+
+reg.cv <-  
+  train(Trip_Count ~ start_station + hour(interval60) + dotw + Temperature + Precipitation +
+                   lagHour + lag2Hours +lag3Hours +lag12Hours + lag1day , 
+        data = bikenetsample,  
+        method = "lm",  
+        trControl = fitControl,  
+        na.action = na.pass)
+
+reg.cv
+```
+
+
+
+# 8 Accuracy
+
+The best models - the lag models, are accurate to less than an average of one ride per hour, at a glance, that's pretty alright for overall accuracy.
+
+
+## 8.1 General Error Metrics
+
+First, we look at the MAE as a bar plot for the five different regressions. As you can see the regressions with time lags and the amenity features have lesser MAE.
+
+```{r plot_errors_by_model }
+week_predictions %>%
+  dplyr::select(week, Regression, MAE) %>%
+  gather(Variable, MAE, -Regression, -week) %>%
+  ggplot(aes(week, MAE)) + 
+    geom_bar(aes(fill = Regression), position = "dodge", stat="identity") +
+    scale_fill_manual(values = palette5) +
+    labs(title = "Mean Absolute Errors by model specification and week") +
+  plotTheme()
+```
+
+For each model, predicted and observed trips are plotted in time series form below. Time lags help to improve the ability to predict the highest peaks.Similarly, as the plots above show, reg4 and 5 have the best accuracy.
+
+```{r error_vs_actual_timeseries , warning = FALSE, message = FALSE, fig.height=8}
+week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           start_station = map(data, pull, start_station)) %>%
+    dplyr::select(interval60, start_station, Observed, Prediction, Regression) %>%
+    unnest() %>%
+    gather(Variable, Value, -Regression, -interval60, -start_station) %>%
+    group_by(Regression, Variable, interval60) %>%
+    summarize(Value = sum(Value)) %>%
+    ggplot(aes(interval60, Value, colour=Variable)) + 
+      geom_line(size = 1.1) + 
+      facet_wrap(~Regression, ncol=1) +
+      labs(title = "Predicted/Observed bike share time series", subtitle = "Los Angeles; A test set of 2 weeks",  x = "Hour", y= "Station Trips") +
+      plotTheme()
+```
+
+Moving forward, let's stick with `reg5`, which seems to have the best goodness of fit generally.
+
+## 8.2 Space-Time Error Evaluation
+
+The highest error is in and around downtown LA. The error is high because the area has the highest bike ride volume but a less regular pattern of bike share demand.
+
+```{r errors_by_station, warning = FALSE, message = FALSE }
+week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           start_station = map(data, pull, start_station), 
+           start_lat = map(data, pull, start_lat), 
+           start_lon = map(data, pull, start_lon)) %>%
+    select(interval60, start_station, start_lon, start_lat, Observed, Prediction, Regression) %>%
+    unnest() %>%
+  filter(Regression == "ETime_Space_FE_timeLags_amenity") %>%
+  group_by(start_station, start_lon, start_lat) %>%
+  summarize(MAE = mean(abs(Observed-Prediction), na.rm = TRUE))%>%
+ggplot(.)+
+  geom_sf(data = LACensus, color = "grey", fill = "transparent")+
+  geom_point(aes(x = start_lon, y = start_lat, color = MAE), 
+             fill = "transparent", alpha = 0.4)+
+  scale_colour_viridis(direction = -1,
+  discrete = FALSE, option = "D")+
+  ylim(min(dat_census$start_lat), max(dat_census$start_lat))+
+  xlim(min(dat_census$start_lon), max(dat_census$start_lon))+
+  labs(title="Mean Abs Error, Test Set, Model 5")+
+  mapTheme()
+```
+
+
+
+
+Some patterns begin to emerge in the plots observed vs. predicted for different times of day during the week and weekend. We are certainly underpredicting in general, especially during the weekend. This could be because we have fewer samples on weekends. Also, people tend to have longer and less regular trips during weekends.
+
+```{r obs_pred_all, warning=FALSE, message = FALSE, cache=TRUE}
+week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           start_station = map(data, pull, start_station), 
+           start_lat = map(data, pull, start_lat), 
+           start_lon = map(data, pull, start_lon),
+           dotw = map(data, pull, dotw)) %>%
+    select(interval60, start_station, start_lon, 
+           start_lat, Observed, Prediction, Regression,
+           dotw) %>%
+    unnest() %>%
+  filter(Regression == "ETime_Space_FE_timeLags_amenity")%>%
+  mutate(weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+         time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush"))%>%
+  ggplot()+
+  geom_point(aes(x= Observed, y = Prediction))+
+    geom_smooth(aes(x= Observed, y= Prediction), method = "lm", se = FALSE, color = "red")+
+    geom_abline(slope = 1, intercept = 0)+
+  facet_grid(time_of_day~weekend)+
+  labs(title="Observed vs Predicted",
+       x="Observed trips", 
+       y="Predicted trips")+
+  plotTheme()
+```
+
+From maps of MAE by weekend/weekday and time of day, we can find that errors concentrated in certain areas - along the beach (both south and west) during midday and afternoon, especially on weekends, in Downtown all the time, but especially during pm rush hour.
+
+To better re-balance bikes,  we should pay special attention to those areas, and monitor them more closely and act responsively.
+
+```{r station_summary, warning=FALSE, message = FALSE }
+week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           start_station = map(data, pull, start_station), 
+           start_lat = map(data, pull, start_lat), 
+           start_lon = map(data, pull, start_lon),
+           dotw = map(data, pull, dotw) ) %>%
+    select(interval60, start_station, start_lon, 
+           start_lat, Observed, Prediction, Regression,
+           dotw) %>%
+    unnest() %>%
+  filter(Regression == "ETime_Space_FE_timeLags_amenity")%>%
+  mutate(weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+         time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush")) %>%
+  group_by(start_station, weekend, time_of_day, start_lon, start_lat) %>%
+  summarize(MAE = mean(abs(Observed-Prediction), na.rm = TRUE))%>%
+  ggplot(.)+
+  geom_sf(data = LACensus, color = "grey", fill = "grey95")+
+  geom_point(aes(x = start_lon, y = start_lat, color = MAE), 
+             fill = "transparent", size =1, alpha = 0.4)+
+  scale_colour_viridis(direction = -1,
+  discrete = FALSE, option = "D")+
+  ylim(min(dat_census$start_lat), max(dat_census$start_lat))+
+  xlim(min(dat_census$start_lon), max(dat_census$start_lon))+
+  facet_grid(weekend~time_of_day)+
+  labs(title="Mean Absolute Errors, Test Set")+
+  mapTheme()
+  
+```
+
+Let's focus on the morning commute, where station locations probably relate to likely users. Here we plot the error as a function of income, percentage of white, and percentage taking public transit. As you can see, the model's error increases in tracts where more people are taking public transit and decreases when they are a higher percentage of white. The model has a constant error across income. The results indicate most people using share bikes during AM rush time in LA do not take public transit. Using share bikes might be more of a healthy or convenient choice than economic consideration. 
+
+```{r station_summary2, warning=FALSE, message = FALSE, fig.width= 10 }
+week_predictions %>% 
+    mutate(interval60 = map(data, pull, interval60),
+           start_station = map(data, pull, start_station), 
+           start_lat = map(data, pull, start_lat), 
+           start_lon = map(data, pull, start_lon),
+           dotw = map(data, pull, dotw),
+           Percent_Taking_Public_Trans = map(data, pull, Percent_Taking_Public_Trans),
+           Med_Inc = map(data, pull, Med_Inc),
+           Percent_White = map(data, pull, Percent_White)) %>%
+    select(interval60, start_station, start_lon, 
+           start_lat, Observed, Prediction, Regression,
+           dotw, Percent_Taking_Public_Trans, Med_Inc, Percent_White) %>%
+    unnest() %>%
+  filter(Regression == "ETime_Space_FE_timeLags_amenity")%>%
+  mutate(weekend = ifelse(dotw %in% c("Sun", "Sat"), "Weekend", "Weekday"),
+         time_of_day = case_when(hour(interval60) < 7 | hour(interval60) > 18 ~ "Overnight",
+                                 hour(interval60) >= 7 & hour(interval60) < 10 ~ "AM Rush",
+                                 hour(interval60) >= 10 & hour(interval60) < 15 ~ "Mid-Day",
+                                 hour(interval60) >= 15 & hour(interval60) <= 18 ~ "PM Rush")) %>%
+  filter(time_of_day == "AM Rush") %>%
+  group_by(start_station, Percent_Taking_Public_Trans, Med_Inc, Percent_White) %>%
+  summarize(MAE = mean(abs(Observed-Prediction), na.rm = TRUE))%>%
+  gather(-start_station, -MAE, key = "variable", value = "value")%>%
+  ggplot(.)+
+  #geom_sf(data = LACensus, color = "grey", fill = "transparent")+
+  geom_point(aes(x = value, y = MAE), alpha = 0.4)+
+  geom_smooth(aes(x = value, y = MAE), method = "lm", se= FALSE)+
+  facet_wrap(~variable, scales = "free")+
+  labs(title="Errors as a function of socio-economic variables",
+       y="Mean Absolute Error (Trips)")+
+  plotTheme()
+  
+```
+
+## 8.3 Animation
+
+Last we look at the trip count by stations as an animation for one week during July.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+
+
+library(gganimate)
+library(gifski)
+
+week30 <-
+  filter(dat_census , week == 30)
+
+week30.panel <-
+  expand.grid(
+    interval15 = unique(week30$interval15),
+    Pickup.Census.Tract = unique(dat_census$start_station))
+
+ride.animation.data <-
+  mutate(week30, Trip_Counter = 1) %>%
+  select(interval15, start_station, start_lon, 
+           start_lat, Trip_Counter) %>%
+  group_by(interval15, start_station, start_lon, start_lat) %>%
+  summarize(Trip_Count = sum(Trip_Counter, na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(Trips = case_when(Trip_Count == 0 ~ "0 trips",
+                           Trip_Count > 0 & Trip_Count <= 2 ~ "0-2 trips",
+                           Trip_Count > 2 & Trip_Count <= 5 ~ "2-5 trips",
+                           Trip_Count > 5 & Trip_Count <= 10 ~ "5-10 trips",
+                           Trip_Count > 10 & Trip_Count <= 15 ~ "10-15 trips",
+                           Trip_Count > 15 ~ "15+ trips")) %>%
+  mutate(Trips  = fct_relevel(Trips, "0 trips","0-2 trips","2-5 trips",
+                              "5-10 trips","10-15 trips","15+ trips"))
+
+rideshare_animation <-
+  ggplot()+
+  geom_sf(data = LATracts %>%
+            st_transform(crs=4326), colour = '#efefef')+
+  geom_point(data = ride.animation.data, 
+             aes(x = start_lon, y = start_lat, color= Trips), size = 2, alpha = 1.5) +
+  scale_colour_manual(values = palette3) +
+  labs(title = "Rideshare pickups for one week in March 2018",
+       subtitle = "15 minute intervals: {current_frame}") +
+  transition_manual(interval15) +
+  ylim(min(dat_census$start_lat), max(dat_census$start_lat))+
+  xlim(min(dat_census$start_lon), max(dat_census$start_lon))+
+  mapTheme()
+
+animate(rideshare_animation, duration=20, renderer = gifski_renderer())
+```
+
+
+
+# 9 Conclusion
+
+Our time-series plots suggest that we can track the time components of demand, but we miss the peaks and underpredict periods of high demand. If we use this model to re-balance bikes across stations, we might provide fewer bikes than it needs during peak time.
+
+Based on subsequent maps of our errors, we can see that these peaks seem to have some spatial or demographic pattern. For the next steps, we could consider calculating different models for different study areas based on clusters since they seem to have pretty different patterns of bike share demand. Besides, collecting and testing with more amenity features could help as well.
+
+In conclusion, we could use this model as a base for re-balance the system by managing a small fleet of trucks to move bikes. However, to make the system work more efficiently, we should consider more LA local conditions and adjust the model to fit better.
